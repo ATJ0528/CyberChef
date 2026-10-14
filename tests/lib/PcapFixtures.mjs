@@ -123,19 +123,6 @@ function u16be(value) {
 
 
 /**
- * 构造一个 4 字节的大端无符号整数。
- *
- * @param {number} value
- * @returns {Uint8Array}
- */
-function u32be(value) {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setUint32(0, value >>> 0, false);
-    return b;
-}
-
-
-/**
  * 把 "192.168.1.10" 形式的字符串转成 4 字节。
  *
  * @param {string} ip
@@ -575,20 +562,17 @@ export function httpSessionFixture(opts = {}) {
         format = "pcap",
         littleEndian = true,
         includeHandshake = true,
+        clientIp = "192.168.1.10",
+        serverIp = "93.184.216.34",
+        clientPort = 49152,
+        serverPort = 80,
+        clientISN = 1000,
+        serverISN = 5000,
+        requestBody = "GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: CyberChef-Test/1.0\r\nAccept: */*\r\n\r\n",
+        responseHead = "HTTP/1.1 200 OK\r\nServer: nginx/1.18.0\r\nContent-Type: text/html\r\nContent-Length: 25\r\n\r\n",
+        responseBody = "<html><body>Hello!</body>",
     } = opts;
 
-    const clientIp = "192.168.1.10";
-    const serverIp = "93.184.216.34";
-    const clientPort = 49152;
-    const serverPort = 80;
-
-    // 双方初始序列号
-    const clientISN = 1000;
-    const serverISN = 5000;
-
-    const requestBody = "GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: CyberChef-Test/1.0\r\nAccept: */*\r\n\r\n";
-    const responseHead = "HTTP/1.1 200 OK\r\nServer: nginx/1.18.0\r\nContent-Type: text/html\r\nContent-Length: 27\r\n\r\n";
-    const responseBody = "<html><body>Hello!</body>";
 
     const packets = [];
     let t = 1600000000.0;
@@ -654,9 +638,9 @@ export function httpSessionFixture(opts = {}) {
     serverNext += 1;
     push(clientIp, serverIp, clientPort, serverPort, clientNext, serverNext, ACK, [], 0.002);
 
-    const bytes = format === "pcapng"
-        ? buildPcapng(packets, {littleEndian, linkType: 1})
-        : buildPcap(packets, {littleEndian, linkType: 1});
+    const bytes = format === "pcapng" ?
+        buildPcapng(packets, {littleEndian, linkType: 1}) :
+        buildPcap(packets, {littleEndian, linkType: 1});
 
     return {
         bytes,
