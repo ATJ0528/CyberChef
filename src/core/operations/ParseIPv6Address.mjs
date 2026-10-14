@@ -4,6 +4,43 @@
  * @license Apache-2.0
  */
 
+/**
+ * ============================================================
+ * 【模块】网络协议解析（Networking）— IPv6 地址解析
+ * 【操作】Parse IPv6 address
+ * 【功能】把一个 IPv6 地址同时以完整写法（Longhand）与压缩写法（Shorthand）展示，
+ *         并识别它落入了哪一段保留地址 / 过渡或隧道技术
+ * 【输入】string —— 单个 IPv6 地址（允许 :: 压缩写法）
+ * 【输出】string —— 多行纯文本报告，逐条列出地址分析与保留范围判定
+ * ------------------------------------------------------------
+ * 【业务流程】
+ *   1. 用 IPV6_REGEX 匹配输入，取第 1 个捕获组作为地址本体
+ *   2. strToIpv6() 将地址解析为 8 个 16 位 hextet 的数组 ipv6[0..7]
+ *   3. ipv6ToStr() 分别生成 Longhand（补零展开）与 Shorthand（:: 压缩）两种写法
+ *   4. 按 hextet 前缀逐条比对保留地址表，命中即追加对应说明
+ *      （Unspecified / Loopback / IPv4-mapped / Teredo / 6to4 / ULA / 组播…）
+ *   5. 检测 Interface Identifier 是否含 FF:FE，若含则还原出 modified EUI-64 与 MAC
+ *   6. 匹配失败则抛 OperationError("Invalid IPv6 address")
+ * ------------------------------------------------------------
+ * 【关键算法】
+ *   - 6to4 地址（前缀 2002::/16）：hextet[1]、hextet[2] 拼成内嵌 IPv4，
+ *     hextet[3] 是 SLA ID，hextet[4..7] 组成 64 位 Interface ID；因该整数可能
+ *     超过 JS 2^53 安全整数上限，故用 BigNumber 以大数方式处理
+ *   - Teredo（前缀 2001::/32）：UDP 端口与 Client IPv4 在报文中按位取反存储，
+ *     解析时用 `~` 再取反，并用 `& 0xffff` 截回 16 位
+ *   - 标志位抽取：`(ipv6[4] >>> 15) & 1`、`>>> 14`、`>>> 10`、`>>> 8` 把
+ *     一个 hextet 拆成 Cone/R/Random1/UG/Random2 位域
+ *   - modified EUI-64 还原 MAC：丢开中间的 FF:FE，再把首字节的
+ *     第 7 位（U/L 通用/本地位，掩码 0x02）取反（` ^ 2`）得到原始 MAC
+ * ------------------------------------------------------------
+ * 【开发技巧】
+ *   - 大量保留段的判定统一用「前缀比对」的 if / else if 链，书写顺序即优先级：
+ *     把更特殊、更长的前缀排在前面，避免被短前缀提前命中
+ *   - 校验性问题（如 Teredo 的 R/UG 标志违规）不抛异常，而是拼进输出文本，
+ *     便于人工一次性看全所有异常
+ * ============================================================
+ */
+
 import Operation from "../Operation.mjs";
 import Utils from "../Utils.mjs";
 import OperationError from "../errors/OperationError.mjs";
@@ -11,10 +48,20 @@ import {strToIpv6, ipv6ToStr, ipv4ToStr, IPV6_REGEX} from "../lib/IP.mjs";
 import BigNumber from "bignumber.js";
 
 /**
+ * 【类】ParseIPv6Address —— IPv6 地址解析操作
+ * 继承 Operation 基类，本操作只实现 run()；输入输出均为 string，且无参数。
+ */
+/**
  * Parse IPv6 address operation
  */
 class ParseIPv6Address extends Operation {
 
+    /**
+     * 【构造函数】声明本操作的元信息
+     * name = "Parse IPv6 address"，module = "Default"，
+     * inputType / outputType 均为 "string"（纯文本进、纯文本出），
+     * args 为空数组 —— 本操作没有任何可调参数。
+     */
     /**
      * ParseIPv6Address constructor
      */
@@ -31,6 +78,10 @@ class ParseIPv6Address extends Operation {
     }
 
     /**
+     * 【主流程】解析并报告一个 IPv6 地址
+     * 返回值为多行文本报告；若输入不能被 IPV6_REGEX 匹配则抛 OperationError。
+     */
+    /**
      * @param {string} input
      * @param {Object[]} args
      * @returns {string}
@@ -46,6 +97,7 @@ class ParseIPv6Address extends Operation {
 
             output += "Longhand:  " + longhand + "\nShorthand: " + shorthand + "\n";
 
+            // --- 步骤 4：逐条比对 IPv6 保留地址段（前缀匹配，书写顺序即优先级）---
             // Detect reserved addresses
             if (shorthand === "::") {
                 // Unspecified address
@@ -80,6 +132,7 @@ class ParseIPv6Address extends Operation {
             } else if (ipv6[0] === 0x2001 && ipv6[1] === 0) {
                 // Teredo tunneling
                 output += "\nTeredo tunneling IPv6 address detected\n";
+                // Teredo：UDP 端口与 Client IPv4 在报文中按位取反存储，解析时再取反还原
                 const serverIpv4  = (ipv6[2] << 16) + ipv6[3],
                     udpPort     = (~ipv6[5]) & 0xffff,
                     clientIpv4  = ~((ipv6[6] << 16) + ipv6[7]),
@@ -144,6 +197,7 @@ class ParseIPv6Address extends Operation {
                 output += "\n6to4 transition IPv6 address detected. See RFC 3056 for more details." +
                     "\n6to4 prefix range: 2002::/16";
 
+                // 6to4：hextet[1..2] 拼成内嵌 IPv4，hextet[3]=SLA ID，hextet[4..7]=64 位 Interface ID
                 const v4Addr = ipv4ToStr((ipv6[1] << 16) + ipv6[2]),
                     slaId = ipv6[3],
                     interfaceIdStr = ipv6[4].toString(16) + ipv6[5].toString(16) + ipv6[6].toString(16) + ipv6[7].toString(16),
@@ -251,6 +305,7 @@ class ParseIPv6Address extends Operation {
             }
 
 
+            // --- 步骤 5：检测 Interface Identifier 中的 FF:FE，还原 modified EUI-64 / MAC ---
             // Detect possible EUI-64 addresses
             if (((ipv6[5] & 0xff) === 0xff) && (ipv6[6] >>> 8 === 0xfe)) {
                 output += "\n\nThis IPv6 address contains a modified EUI-64 address, identified by the presence of FF:FE in the 12th and 13th octets.";
