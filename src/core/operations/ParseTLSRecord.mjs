@@ -4,16 +4,75 @@
  * @license Apache-2.0
  */
 
+/**
+ * ============================================================
+ * 【模块】网络协议解析（Networking）— TLS 记录层与握手协议
+ * 【操作】Parse TLS record
+ * 【功能】把一段（或连续多段）原始 TLS Record 字节流，逐层拆解为
+ *         记录层首部 + 握手子协议（Hello/Certificate/…）+ 扩展字段的可读结构
+ * 【输入】ArrayBuffer —— 完整的 TLS 记录流（可含多条记录，也可只含一条）
+ * 【输出】json —— 解析结果对象数组；presentType 为 html，界面按表格展示
+ * ------------------------------------------------------------
+ * 【业务流程】
+ *   1. 用 Stream 包裹整个输入，while (s.hasMore()) 逐条读取 Record
+ *   2. _readRecord()：读 5 字节记录头（ContentType / Version / Length），
+ *      再按 Length 取出记录载荷 content
+ *   3. 载荷若为 HANDSHAKE（类型码 22）则交给 HandshakeParser 继续拆；
+ *      其它类型（Alert/AppData/CCS）直接把整段载荷转 hex 存入 value
+ *   4. HandshakeParser：读 1 字节 msg_type + 3 字节 length，
+ *      再按消息类型分派到各自的子解析器（ClientHello/ServerHello/…）
+ *   5. 子解析器按 RFC 5246/8446 的定长或长度前缀结构逐字段读取
+ *   6. present()：用 objToTable 把每个结果对象递归渲染成 HTML 表格
+ * ------------------------------------------------------------
+ * 【关键算法】TLV 解析 + Stream 游标状态机
+ *   - 长度前缀（TLV）：TLS 里绝大多数变长字段都是"长度字段在前、内容在后"，
+ *     统一用 readSizePrefixedBytesAsHex() 读取，避免每个解析器重复实现
+ *   - Stream 游标：所有读取都靠 input.position 单向推进；一旦发现越界，
+ *     一律 moveTo(length) 把游标推到流末尾，保证外层 while 能正常收敛退出
+ *   - 名称查表：构造函数把 ContentType / HandshakeType 枚举反转成
+ *     "数值 → 名称" 映射，未知类型用 ?? 退化为十进制数字字符串
+ *   - 截断容错：每个长度前缀字段读完都比对声明长度与实读长度，
+ *     不足则记 truncated: true，而不是抛异常中断解析
+ * ------------------------------------------------------------
+ * 【开发技巧】
+ *   - 每个子解析器只关心"自己这一段字节"，因此都重新 new Stream(局部切片)，
+ *     实现各协议层互相解耦
+ *   - 用 Object.freeze 的枚举对象集中管理协议常量，可读性远好于散落的魔法数字
+ *   - `{...recordHeader}` 与 `{...output, ...子结果}` 展开语法把头部字段
+ *     与各层解析结果扁平合并，最终交给 present() 统一渲染
+ * ============================================================
+ */
+
 import Operation from "../Operation.mjs";
 import {toHexFast} from "../lib/Hex.mjs";
 import {objToTable} from "../lib/Protocol.mjs";
 import Stream from "../lib/Stream.mjs";
 
 /**
+ * 【类】ParseTLSRecord —— 顶层操作类，对应 CyberChef 界面上的
+ *      "Parse TLS record" 操作，继承自 Operation 基类。
+ *
+ * 持有两个跨调用复用的对象：
+ *   - _handshakeParser：握手消息解析器（内部又聚合了六个子消息解析器）
+ *   - _contentTypes：ContentType 数值 → 小写名称的反向查找表，
+ *     在构造函数里由 ContentType 枚举一次性构建
+ */
+/**
  * Parse TLS record operation.
  */
 class ParseTLSRecord extends Operation {
 
+    /**
+     * 【构造函数】声明操作元信息并准备解析器
+     *
+     * inputType   = "ArrayBuffer" —— 直接拿到原始字节，不做文本转换
+     * outputType  = "json"        —— run() 返回结构化对象数组
+     * presentType = "html"        —— 呈现阶段用 present() 渲染成表格
+     * args        = []            —— 本操作无参数，全自动解析
+     *
+     * for...in 遍历 ContentType 时，key 是枚举名、ContentType[key] 是数值，
+     * 因此建立的是 "数值 → 名称" 映射，供 _readRecord 把 type 字段翻译成名字。
+     */
     /**
      * ParseTLSRecord constructor.
      */
@@ -37,6 +96,12 @@ class ParseTLSRecord extends Operation {
     }
 
     /**
+     * 【主流程】解析一整段输入中的所有 TLS Record
+     *
+     * 用 Stream 包住输入并按游标推进，只要 hasMore() 为真就继续读下一条记录；
+     * 当剩余字节连 5 字节记录头都读不全时，_readRecord 返回 null，循环自然收敛结束。
+     */
+    /**
      * @param {ArrayBuffer} input - Stream, containing one or more raw TLS Records.
      * @param {Object[]} args
      * @returns {Object[]} Array of Object representations of TLS Records contained within input.
@@ -56,6 +121,20 @@ class ParseTLSRecord extends Operation {
         return output;
     }
 
+    /**
+     * 【记录层解析】读取并解析一条 TLS Record
+     *
+     * RFC 5246 §6.2 记录层结构（共 5 字节头）：
+     *   ContentType type;        // 1 字节：20=change_cipher_spec 21=alert
+     *                            //        22=handshake 23=application_data
+     *   ProtocolVersion version; // 2 字节：如 0x0303 表示 TLS 1.2
+     *   uint16 length;           // 2 字节：后续 fragment 的字节数
+     *   opaque fragment[...];    // length 字节的载荷
+     *
+     * 分支处理：剩余不足 5 字节（头都读不全）→ 游标推到末尾并返回 null；
+     * 载荷为空 → 只返回记录头对象；类型为 HANDSHAKE → 交给 _handshakeParser 继续拆；
+     * 其它类型 → 载荷整体转 hex 存进 value 字段。
+     */
     /**
      * Reads a TLS Record from the following bytes in the provided Stream.
      *
@@ -95,6 +174,12 @@ class ParseTLSRecord extends Operation {
     }
 
     /**
+     * 【呈现】把解析结果数组渲染为 HTML
+     *
+     * 逐条调用 objToTable 递归生成字段表格（嵌套对象/数组会自动展开为子表），
+     * 记录之间用空行分隔；返回值由框架以 presentType="html" 直接展示。
+     */
+    /**
      * Displays the parsed TLS Records in a tabular style.
      *
      * @param {Object[]} data - Array of Object representations of the TLS Records.
@@ -108,6 +193,11 @@ class ParseTLSRecord extends Operation {
 export default ParseTLSRecord;
 
 /**
+ * 【枚举】TLS Record 层 ContentType 取值（RFC 5246 §6.2.1）
+ * 20=change_cipher_spec 21=alert 22=handshake 23=application_data
+ * 用 Object.freeze 固化；构造函数会据此建立"数值 → 名称"反查表。
+ */
+/**
  * Repesents the known values of type field of a TLS Record header.
  */
 const ContentType = Object.freeze({
@@ -118,9 +208,18 @@ const ContentType = Object.freeze({
 });
 
 /**
+ * 【数据类】RecordHeader —— 仅用于承载记录层首部的三个字段
+ * type=记录类型名，version=版本 hex 串，length=载荷长度；
+ * 仅当载荷被截断（实读字节少于声明长度）时才附带 truncated=true。
+ */
+/**
  * Represents a TLS Record header
  */
 class RecordHeader {
+    /**
+     * 【构造函数】保存记录头的 type / version / length 三个字段；
+     * 仅当 truncated 为真时才写入 truncated 标记，避免结果中充斥无意义的 false。
+     */
     /**
      * RecordHeader cosntructor.
      *
@@ -141,10 +240,21 @@ class RecordHeader {
 }
 
 /**
+ * 【类】HandshakeParser —— TLS 握手消息解析器
+ *
+ * 聚合了 ClientHello / ServerHello / NewSessionTicket / Certificate /
+ * CertificateRequest / CertificateVerify 六个子解析器，
+ * 并在构造时建立 HandshakeType（msg_type 数值）→ 名称 的反查表。
+ */
+/**
  * Parses TLS Handshake messages.
  */
 class HandshakeParser {
 
+    /**
+     * 【构造函数】实例化六个握手子消息解析器，并构建
+     * HandshakeType（msg_type 数值）→ 名称 的反查表。
+     */
     /**
      * HandshakeParser constructor.
      */
@@ -162,6 +272,19 @@ class HandshakeParser {
         }
     }
 
+    /**
+     * 【握手层解析】解析一条握手消息（记录载荷内部）
+     *
+     * RFC 5246 §7.4 握手消息结构：
+     *   HandshakeType msg_type;    // 1 字节消息类型
+     *   uint24 length;             // 3 字节消息体长度
+     *   body[length];              // 变长消息体
+     *
+     * 关键分支：若 (handshakeLength + 4) !== 记录载荷长度，说明记录里不止
+     * 这一条消息、或内容已被加密（TLS 1.3 的 Finished 等）——此时把游标复位
+     * 后整体按 FINISHED 处理，直接把原始字节转 hex 输出，避免按错误结构误解析；
+     * 否则按 msg_type 分派到对应子解析器，并用 {...output, ...子结果} 合并结果。
+     */
     /**
      * Parses a single TLS handshake message.
      *
@@ -223,6 +346,12 @@ class HandshakeParser {
 }
 
 /**
+ * 【枚举】TLS 握手消息类型 msg_type（RFC 5246 §7.4）
+ * 0=hello_request 1=client_hello 2=server_hello 4=new_session_ticket
+ * 11=certificate 12=server_key_exchange 13=certificate_request
+ * 14=server_hello_done 15=certificate_verify 16=client_key_exchange 20=finished
+ */
+/**
  * Represents the known values of the msg_type field of a TLS Handshake message.
  */
 const HandshakeType = Object.freeze({
@@ -240,10 +369,23 @@ const HandshakeType = Object.freeze({
 });
 
 /**
+ * 【类】ClientHelloParser —— 解析 ClientHello（客户端第一枪，RFC 5246 §7.4.1.2）
+ *
+ * 结构：ProtocolVersion client_version(2) | Random random(32) |
+ *       SessionID session_id（1 字节长度前缀） |
+ *       CipherSuite cipher_suites（2 字节长度前缀的列表） |
+ *       CompressionMethod compression_methods（1 字节长度前缀的列表） |
+ *       Extension extensions（2 字节总长度前缀）
+ * 内置一个 ExtensionsParser 负责最后的扩展列表。
+ */
+/**
  * Parses TLS Handshake ClientHello messages.
  */
 class ClientHelloParser {
 
+    /**
+     * 【构造函数】创建一个扩展解析器 ExtensionsParser 供后续使用。
+     */
     /**
      * ClientHelloParser constructor.
      */
@@ -251,6 +393,12 @@ class ClientHelloParser {
         this._extensionsParser = new ExtensionsParser();
     }
 
+    /**
+     * 【主流程】严格按 RFC 5246 字段顺序读取 ClientHello：
+     * 2 字节 client_version → 32 字节 random → session_id（长度前缀，可为空）→
+     * cipher_suites（列表）→ compression_methods（列表）→ extensions（列表）。
+     * session_id 为空时不写入 output，保持结果精简。
+     */
     /**
      * Parses a single TLS Handshake ClientHello message.
      *
@@ -276,6 +424,9 @@ class ClientHelloParser {
     }
 
     /**
+     * 【字段】client_version（2 字节）：客户端支持的最高协议版本，如 0x0303 = TLS 1.2。
+     */
+    /**
      * Reads the client_version field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ClientHello message, with position before client_version field.
@@ -285,6 +436,9 @@ class ClientHelloParser {
         return readBytesAsHex(input, 2);
     }
 
+    /**
+     * 【字段】random（32 字节）：客户端随机数，前 4 字节通常为 Unix 时间戳，其余为随机值。
+     */
     /**
      * Reads the random field from the following bytes in the provided Stream.
      *
@@ -296,6 +450,9 @@ class ClientHelloParser {
     }
 
     /**
+     * 【字段】session_id：1 字节长度前缀 + 变长会话 ID；用于会话复用，可为空。
+     */
+    /**
      * Reads the session_id field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ClientHello message, with position before session_id length field.
@@ -305,6 +462,11 @@ class ClientHelloParser {
         return readSizePrefixedBytesAsHex(input, 1);
     }
 
+    /**
+     * 【字段】cipher_suites：2 字节总长度前缀，其后是若干 2 字节密码套件编号。
+     * 先读长度；长度为 0 直接返回空对象；再按 2 字节一组循环读取。
+     * 实读字节不足声明长度时标 truncated。
+     */
     /**
      * Reads the cipher_suites field from the following bytes in the provided Stream.
      *
@@ -337,6 +499,9 @@ class ClientHelloParser {
     }
 
     /**
+     * 【字段】compression_methods：1 字节长度前缀 + 若干 1 字节压缩方法（通常只有 0 = null）。
+     */
+    /**
      * Reads the compression_methods field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ClientHello message, with position before compression_methods length field.
@@ -368,6 +533,9 @@ class ClientHelloParser {
     }
 
     /**
+     * 【字段】extensions：2 字节总长度前缀，内容交给 ExtensionsParser 展开成数组。
+     */
+    /**
      * Reads the extensions field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ClientHello message, with position before extensions length field.
@@ -393,10 +561,20 @@ class ClientHelloParser {
 }
 
 /**
+ * 【类】ServerHelloParser —— 解析 ServerHello（服务器应答，RFC 5246 §7.4.1.3）
+ *
+ * 结构与 ClientHello 类似，但密码套件/压缩方法是"单值"而非列表：
+ *   server_version(2) | random(32) | session_id（1 字节前缀） |
+ *   cipher_suite（2 字节单值） | compression_method（1 字节单值） | extensions（2 字节前缀）
+ */
+/**
  * Parses TLS Handshake ServeHello messages.
  */
 class ServerHelloParser {
 
+    /**
+     * 【构造函数】创建一个扩展解析器 ExtensionsParser 供后续使用。
+     */
     /**
      * ServerHelloParser constructor.
      */
@@ -404,6 +582,10 @@ class ServerHelloParser {
         this._extensionsParser = new ExtensionsParser();
     }
 
+    /**
+     * 【主流程】按序读取：server_version → random → session_id（可空）→
+     * 服务器选定的 cipher_suite（单值 2 字节）→ compression_method（单值 1 字节）→ extensions。
+     */
     /**
      *  Parses a single TLS Handshake ServerHello message.
      *
@@ -429,6 +611,9 @@ class ServerHelloParser {
     }
 
     /**
+     * 【字段】server_version（2 字节）：服务器最终选定的协议版本。
+     */
+    /**
      * Reads the server_version field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ServerHello message, with position before server_version field.
@@ -438,6 +623,9 @@ class ServerHelloParser {
         return readBytesAsHex(input, 2);
     }
 
+    /**
+     * 【字段】random（32 字节）：服务器随机数。
+     */
     /**
      * Reads the random field from the following bytes in the provided Stream.
      *
@@ -449,6 +637,9 @@ class ServerHelloParser {
     }
 
     /**
+     * 【字段】session_id：1 字节长度前缀 + 会话 ID；会话复用时与客户端保持一致。
+     */
+    /**
      * Reads the session_id field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ServertHello message, with position before session_id length field.
@@ -458,6 +649,9 @@ class ServerHelloParser {
         return readSizePrefixedBytesAsHex(input, 1);
     }
 
+    /**
+     * 【字段】cipher_suite（2 字节单值）：服务器从客户端列表中选中的密码套件。
+     */
     /**
      * Reads the cipher_suite field from the following bytes in the provided Stream.
      *
@@ -469,6 +663,9 @@ class ServerHelloParser {
     }
 
     /**
+     * 【字段】compression_method（1 字节单值）：服务器选定的压缩方法。
+     */
+    /**
      * Reads the compression_method field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw ServerHello message, with position before compression_method field.
@@ -478,6 +675,9 @@ class ServerHelloParser {
         return readBytesAsHex(input, 1);
     }
 
+    /**
+     * 【字段】extensions：2 字节总长度前缀，交由 ExtensionsParser 解析。
+     */
     /**
      * Reads the extensions field from the following bytes in the provided Stream.
      *
@@ -504,10 +704,25 @@ class ServerHelloParser {
 }
 
 /**
+ * 【类】ExtensionsParser —— 解析 Hello 消息尾部的扩展列表
+ *
+ * 每个扩展是一个 TLV（RFC 5246 §7.4.1.4 / RFC 8446 §4.2）：
+ *   ExtensionType extension_type; // 2 字节扩展类型
+ *   uint16 extension_length;      // 2 字节扩展数据长度
+ *   opaque extension_data[...];   // 变长扩展数据
+ * 常见 type：0x0000=server_name(SNI) 0x002b=supported_versions
+ * 0x0033=key_share 0x0010=ALPN 0x000a=supported_groups 等。
+ * 本解析器只做通用 TLV 拆分，不逐类深入解释扩展内容，value 以 hex 呈现。
+ */
+/**
  * Parses TLS Handshake Hello Extensions.
  */
 class ExtensionsParser {
 
+    /**
+     * 【主流程】循环调用 _readExtension，直到流耗尽，
+     * 把连续多个扩展拆成 Object 数组（外层已保证总长度正确）。
+     */
     /**
      * Parses a stream of TLS Handshake Hello Extensions.
      *
@@ -527,6 +742,12 @@ class ExtensionsParser {
         return output;
     }
 
+    /**
+     * 【单条扩展】读取一个 TLV 扩展：
+     * 若剩余不足 4 字节（连 type + length 都读不全）→ 推到末尾返回 null；
+     * 再读 2 字节 type（hex）、2 字节 length；长度为 0 直接返回；
+     * 否则读 length 字节 value 并转 hex，实读不足则标 truncated。
+     */
     /**
      * Reads a single Extension from the following bytes in the provided Stream.
      *
@@ -561,10 +782,20 @@ class ExtensionsParser {
 }
 
 /**
+ * 【类】NewSessionTicketParser —— 解析 NewSessionTicket（RFC 5077 / RFC 8446 §4.6.1）
+ *
+ * 结构：uint32 ticket_lifetime_hint（4 字节）|
+ *       opaque ticket<2..2^16-1>（2 字节长度前缀）。
+ * 用于服务器下发会话票据，客户端后续可凭票据免完整握手续传。
+ */
+/**
  * Parses TLS Handshake NewSessionTicket messages.
  */
 class NewSessionTicketParser {
 
+    /**
+     * 【主流程】读取 ticket_lifetime_hint（4 字节，单位秒）与 ticket（2 字节长度前缀）。
+     */
     /**
      * Parses a single TLS Handshake NewSessionTicket message.
      *
@@ -578,6 +809,10 @@ class NewSessionTicketParser {
         };
     }
 
+    /**
+     * 【字段】ticket_lifetime_hint（4 字节大端无符号数）：票据有效期，单位秒，
+     * 输出时附上 "s" 后缀；剩余不足 4 字节则返回空串。
+     */
     /**
      * Reads the ticket_lifetime_hint field from the following bytes in the provided Stream.
      *
@@ -594,6 +829,9 @@ class NewSessionTicketParser {
     }
 
     /**
+     * 【字段】ticket：2 字节长度前缀 + 会话票据字节，hex 输出。
+     */
+    /**
      * Reads the ticket field fromt the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw NewSessionTicket message, with position before ticket length field.
@@ -605,10 +843,21 @@ class NewSessionTicketParser {
 }
 
 /**
+ * 【类】CertificateParser —— 解析 Certificate（服务器证书链，RFC 5246 §7.4.2）
+ *
+ * 结构：certificate_list<3 字节总长度>，其内是若干
+ *       ASN.1Cert<3 字节长度 + DER 证书>。
+ * 此处只按长度前缀切分证书并 hex 呈现；DER 内容本身可继续交给
+ * 其它操作（如 Parse X.509）解析。
+ */
+/**
  * Parses TLS Handshake Certificate messages.
  */
 class CertificateParser {
 
+    /**
+     * 【主流程】读取 certificate_list 字段（证书链）。
+     */
     /**
      * Parses a single TLS Handshake Certificate message.
      *
@@ -623,6 +872,10 @@ class CertificateParser {
         return output;
     }
 
+    /**
+     * 【字段】certificate_list：3 字节总长度前缀，其后为若干证书，
+     * 每张证书再以 3 字节长度前缀标注；剩余不足 3 字节则直接返回空对象。
+     */
     /**
      * Reads the certificate_list field from the following bytes in the provided Stream.
      *
@@ -660,6 +913,9 @@ class CertificateParser {
     }
 
     /**
+     * 【单张证书】3 字节长度前缀 + DER 证书字节，hex 输出。
+     */
+    /**
      * Reads a single certificate from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a list of certificicates, with position before the length field of the next certificate.
@@ -671,10 +927,21 @@ class CertificateParser {
 }
 
 /**
+ * 【类】CertificateRequestParser —— 解析 CertificateRequest（服务器索取客户端证书，RFC 5246 §7.4.4）
+ *
+ * 结构：certificate_types<1..2^8-1>（1 字节长度前缀，元素 1 字节）|
+ *       supported_signature_algorithms<2..2^16-2>（2 字节长度前缀，元素 2 字节）|
+ *       certificate_authorities<0..2^16-1>（2 字节长度前缀，元素为 2 字节长度前缀的 DN）
+ */
+/**
  * Parses TLS Handshake CertificateRequest messages.
  */
 class CertificateRequestParser {
 
+    /**
+     * 【主流程】依次读取 certificate_types、supported_signature_algorithms、
+     * certificate_authorities；仅当 authorities 非空时才写入结果对象。
+     */
     /**
      * Parses a single TLS Handshake CertificateRequest message.
      *
@@ -695,6 +962,10 @@ class CertificateRequestParser {
         return output;
     }
 
+    /**
+     * 【字段】certificate_types：1 字节长度前缀 + 若干 1 字节证书类型码
+     * （如 1=rsa_sign 64=ecdsa_sign）。
+     */
     /**
      * Reads the certificate_types field from the following bytes in the provided Stream.
      *
@@ -727,6 +998,10 @@ class CertificateRequestParser {
     }
 
     /**
+     * 【字段】supported_signature_algorithms：2 字节长度前缀 + 若干 2 字节签名算法对
+     * （TLS 1.2 为 hash + signature 组合，RFC 8446 统一为 SignatureScheme）。
+     */
+    /**
      * Reads the supported_signature_algorithms field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw CertificateRequest message, with position before supported_signature_algorithms length field.
@@ -757,6 +1032,10 @@ class CertificateRequestParser {
         return output;
     }
 
+    /**
+     * 【字段】certificate_authorities：2 字节长度前缀，其内每个 DN（可分辨名称）
+     * 再带 2 字节长度前缀。
+     */
     /**
      * Reads the certificate_authorities field from the following bytes in the provided Stream.
      *
@@ -789,6 +1068,9 @@ class CertificateRequestParser {
     }
 
     /**
+     * 【单个 CA】2 字节长度前缀 + 可分辨名称（DN）字节，hex 输出。
+     */
+    /**
      * Reads a single certificate authority from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a list of raw certificate authorities, with position before the length field of the next certificate authority.
@@ -800,10 +1082,21 @@ class CertificateRequestParser {
 }
 
 /**
+ * 【类】CertificateVerifyParser —— 解析 CertificateVerify（客户端证明持有私钥，RFC 5246 §7.4.8）
+ *
+ * 结构：algorithm{HashAlgorithm hash(1); SignatureAlgorithm signature(1)} |
+ *       signature<0..2^16-1>（2 字节长度前缀）。
+ * 注意：RFC 8446 已把 algorithm 改为 2 字节 SignatureScheme，
+ * 本实现仍按 TLS 1.2 的 1 + 1 字节算法对读取。
+ */
+/**
  * Parses TLS Handshake CertificateVerify messages.
  */
 class CertificateVerifyParser {
 
+    /**
+     * 【主流程】读取 algorithm.hash、algorithm.signature、signature 三个字段。
+     */
     /**
      * Parses a single CertificateVerify Message.
      *
@@ -819,6 +1112,9 @@ class CertificateVerifyParser {
     }
 
     /**
+     * 【字段】algorithm.hash（1 字节）：摘要算法，如 4 = sha256。
+     */
+    /**
      * Reads the algorithm.hash field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw CertificateVerify message, with position before algorithm.hash field.
@@ -828,6 +1124,9 @@ class CertificateVerifyParser {
         return readBytesAsHex(input, 1);
     }
 
+    /**
+     * 【字段】algorithm.signature（1 字节）：签名算法，如 1 = rsa。
+     */
     /**
      * Reads the algorithm.signature field from the following bytes in the provided Stream.
      *
@@ -839,6 +1138,9 @@ class CertificateVerifyParser {
     }
 
     /**
+     * 【字段】signature：2 字节长度前缀 + 签名值字节，hex 输出。
+     */
+    /**
      * Reads the signature field from the following bytes in the provided Stream.
      *
      * @param {Stream} input - Stream, containing a raw CertificateVerify message, with position before signature field.
@@ -849,6 +1151,14 @@ class CertificateVerifyParser {
     }
 }
 
+/**
+ * 【工具函数】读取"长度前缀 + 内容"的变长字段并返回 hex 串
+ *
+ * 先按 sizePrefixLength（1/2/3 字节）读出长度；长度为 0 返回空串；
+ * 否则再读 length 字节内容。TLS 中 session_id / ticket / certificate /
+ * certificate_authority 等大量字段都是这种 TLV 形态，此处统一抽象，
+ * 避免各解析器重复实现同一套读取逻辑。
+ */
 /**
  * Read the following size prefixed bytes from the provided Stream, and reuturn as a hex string.
  *
@@ -866,6 +1176,12 @@ function readSizePrefixedBytesAsHex(input, sizePrefixLength) {
     return readBytesAsHex(input, length);
 }
 
+/**
+ * 【工具函数】从流中读 n 个字节并返回带 "0x" 前缀的 hex 字符串
+ *
+ * 读不满 n 字节（流在末尾被截断）时返回空串而不是抛异常，
+ * 保证畸形 / 截断报文也能尽力输出，与整个解析器的容错策略一致。
+ */
 /**
  * Read n bytes from the provided Stream, and return as a hex string.
  *
