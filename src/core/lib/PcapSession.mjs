@@ -313,6 +313,7 @@ export class PcapConversation {
         this.packets = [];          // 属于本会话的包（DissectedPacket）
         this.app = {protocol: APP_PROTOCOL.UNKNOWN, confidence: "unknown", evidence: ""};
         this.reassembled = null;    // 缓存双向重组结果
+        this._clientSide = null;    // 惰性判定，见 clientSide
     }
 
     /**
@@ -322,6 +323,82 @@ export class PcapConversation {
      */
     addPacket(dissected) {
         this.packets.push(dissected);
+        // 新包可能改变「谁是客户端」的判定，作废缓存
+        this._clientSide = null;
+    }
+
+    /**
+     * 把 (ip, port) 映射到规范端 a 或 b。
+     *
+     * @param {string} ip
+     * @param {number} port
+     * @returns {"a"|"b"|null}
+     */
+    _sideOf(ip, port) {
+        if (this.endpoints.a.ip === ip && this.endpoints.a.port === port) return "a";
+        if (this.endpoints.b.ip === ip && this.endpoints.b.port === port) return "b";
+        return null;
+    }
+
+    /**
+     * 判定哪一端是客户端，返回 "a" 或 "b"。
+     *
+     * 【为什么不能直接用 endpoints.a】a/b 只是 compareEndpoints 给出的
+     * 规范排序，作用是让 A→B 与 B→A 落到同一个键上，与谁发起连接无关。
+     * 若把 a 当成客户端，只要服务端 IP 的字典序更小（例如 "104.x" 对
+     * "192.x"），客户端与服务端就会整个反过来。
+     *
+     * TCP：主动发起连接的一端是客户端，即「SYN=1 且 ACK=0」的发送方。
+     *      SYN 可能因抓包起点而缺失，故退化到「任一 SYN 的发送方」。
+     * UDP：没有握手，只能按惯例把端口较小的一端视为服务端。
+     *
+     * @returns {"a"|"b"}
+     */
+    get clientSide() {
+        if (this._clientSide) return this._clientSide;
+
+        let side = null;
+
+        if (this.transportProtocol === "TCP") {
+            let opener = null, anySyn = null;
+            for (const p of this.packets) {
+                const flags = p.transport && p.transport.flags;
+                if (!flags || !flags.syn) continue;
+                if (anySyn === null) anySyn = p;
+                if (!flags.ack) {
+                    opener = p;
+                    break;
+                }
+            }
+            const ref = opener || anySyn;
+            if (ref && ref.network && ref.transport) {
+                side = this._sideOf(ref.network.src, ref.transport.srcPort);
+            }
+        }
+
+        if (!side) {
+            // UDP（或 TCP 里一个 SYN 都没抓到）：端口小的一端当服务端
+            side = this.endpoints.a.port <= this.endpoints.b.port ? "b" : "a";
+        }
+
+        this._clientSide = side;
+        return side;
+    }
+
+    /**
+     * 客户端端点。
+     * @returns {{ip: string, port: number}}
+     */
+    get client() {
+        return this.endpoints[this.clientSide];
+    }
+
+    /**
+     * 服务端端点。
+     * @returns {{ip: string, port: number}}
+     */
+    get server() {
+        return this.endpoints[this.clientSide === "a" ? "b" : "a"];
     }
 
     /**
@@ -358,8 +435,8 @@ export class PcapConversation {
         return {
             key: this.key,
             transportProtocol: this.transportProtocol,
-            client: this.endpoints.a,
-            server: this.endpoints.b,
+            client: this.client,
+            server: this.server,
             appProtocol: this.app.protocol,
             confidence: this.app.confidence,
             evidence: this.app.evidence,
