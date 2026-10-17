@@ -210,6 +210,7 @@
     "node": "npx grunt node",
     "repl": "node --no-warnings src/node/repl.mjs",
     "test": "npx grunt configTests && node --no-warnings --no-deprecation --openssl-legacy-provider tests/node/index.mjs && node --no-warnings --no-deprecation --openssl-legacy-provider --trace-uncaught tests/operations/index.mjs",
+    "test:pcap": "node --no-warnings tests/lib/fixture-check.mjs && node --no-warnings tests/lib/pcap-smoke.mjs && node --no-warnings tests/lib/pcap-e2e.mjs && node --no-warnings tests/lib/pcap-detect.mjs && node --no-warnings tests/lib/pcap-write.mjs && node --no-warnings tests/lib/pcap-filter.mjs && node --no-warnings tests/lib/pcap-streams.mjs && node --no-warnings tests/lib/pcap-errors.mjs && node --no-warnings tests/lib/pcap-frames.mjs",
     "testnodeconsumer": "npx grunt testnodeconsumer",
     "testui": "npx grunt testui",
     "testuidev": "npx nightwatch --env=dev",
