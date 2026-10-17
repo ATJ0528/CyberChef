@@ -273,6 +273,12 @@ export class PcapPacket {
  */
 export class PcapCapture {
 
+    /**
+     * 建立一个空的抓包模型。
+     *
+     * 所有字段都有确定的初值（而不是留 undefined），这样即便解析在
+     * 中途失败，调用方读到的也是"空抓包"而非一片 undefined。
+     */
     constructor() {
         this.format = null;        // "pcap" 或 "pcapng"
         this.byteOrder = "le";     // "le" 或 "be"
@@ -560,7 +566,7 @@ function parsePcapng(bytes, dv, maxPackets) {
     let littleEndian = null;
     let interfaces = [];          // 当前 section 的接口表
     let idbCountInSection = 0;    // IDB 在 section 内从 0 重新编号
-    let packetsInSection = 0;
+    /* 当前 section 内的包计数（仅用于诊断，无外部可见影响）*/
 
     while (offset + PCAPNG_BLOCK_FIXED_OVERHEAD <= bytes.length) {
         // --- 步骤 1：先按大端嗅探块类型，只为识别节头块 ---
@@ -592,7 +598,7 @@ function parsePcapng(bytes, dv, maxPackets) {
 
             sectionIndex++;
             idbCountInSection = 0;
-            packetsInSection = 0;
+
             interfaces = [];
 
             // SHB 体：BOM(4) + 主版本(2) + 次版本(2) + 节长度(8) + 选项
@@ -710,7 +716,7 @@ function parsePcapng(bytes, dv, maxPackets) {
 
                 capture.packets.push(packet);
                 index++;
-                packetsInSection++;
+
                 break;
             }
 
@@ -739,7 +745,7 @@ function parsePcapng(bytes, dv, maxPackets) {
 
                 capture.packets.push(packet);
                 index++;
-                packetsInSection++;
+
                 break;
             }
 
@@ -994,7 +1000,201 @@ function alignTo4(length) {
 }
 
 
+/**
+ * 把若干字节拼接成一个。
+ *
+ * @private
+ * @param {Uint8Array[]} chunks - 待拼接的字节块
+ * @returns {Uint8Array}
+ */
+function concatChunks(chunks) {
+    const total = chunks.reduce((acc, c) => acc + c.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+        out.set(c, offset);
+        offset += c.length;
+    }
+    return out;
+}
+
+
+/**
+ * 把一份抓包模型重新序列化成经典 pcap 字节流。
+ *
+ * 与 parsePcap 互为逆运算，因此本函数保证 parsePcap(writePcap(c)) 能在
+ * 包数据、时间戳、链路类型三个维度还原输入（时间戳受 tick 精度限制，
+ * 微秒以外的位数会被舍去，这与真实 pcap 文件的表达能力一致）。
+ *
+ * 这是"只读解析"走向"可编辑"的关键一步：有了写出能力，过滤、裁剪、
+ * 合并等操作才能产出可被 Wireshark 直接打开的成品文件。
+ *
+ * @param {PcapCapture} capture - 抓包模型
+ * @param {Object} [options={}]
+ * @param {PcapPacket[]} [options.packets] - 只写出这些包，缺省写出 capture.packets 全部
+ * @param {boolean} [options.littleEndian] - 强制指定端序，缺省沿用 capture.byteOrder
+ * @param {boolean} [options.nanosecond] - 是否用纳秒精度，缺省沿用 capture.nanosecond
+ * @param {number} [options.linkType] - 强制指定链路类型，缺省沿用 capture.linkType
+ * @returns {Uint8Array} pcap 文件字节
+ */
+export function writePcap(capture, options = {}) {
+    const packets = options.packets || capture.packets;
+    const littleEndian = options.littleEndian !== undefined ?
+        options.littleEndian :
+        capture.byteOrder !== "be";
+    const nanosecond = options.nanosecond !== undefined ? options.nanosecond : capture.nanosecond;
+    const linkType = options.linkType !== undefined ? options.linkType : capture.linkType;
+
+    // --- 全局头：24 字节 ---
+    const header = new Uint8Array(PCAP_GLOBAL_HEADER_LEN);
+    const hdv = new DataView(header.buffer);
+
+    // 魔数随端序取不同写法：0xa1b2c3d4 微秒、0xa1b23c4d 纳秒
+    const magic = nanosecond ? PCAP_MAGIC.NANOSECOND : PCAP_MAGIC.MICROSECOND;
+    hdv.setUint32(0, magic, littleEndian);
+
+    // 版本固定 2.4 —— 这是业界事实标准，写其他版本多数工具会拒绝
+    hdv.setUint16(4, 2, littleEndian);
+    hdv.setUint16(6, 4, littleEndian);
+    hdv.setUint32(8, 0, littleEndian);                       // thiszone
+    hdv.setUint32(12, 0, littleEndian);                      // sigfigs
+    hdv.setUint32(16, capture.snaplen || 262144, littleEndian);
+    hdv.setUint32(20, linkType === null || linkType === undefined ? LINKTYPE.ETHERNET : linkType, littleEndian);
+
+    const chunks = [header];
+    const tickPerSecond = nanosecond ? 1000000000 : 1000000;
+
+    // --- 逐包写记录头（16 字节）+ 数据 ---
+    for (const pkt of packets) {
+        const rec = new Uint8Array(PCAP_PACKET_HEADER_LEN);
+        const rdv = new DataView(rec.buffer);
+
+        // 秒与小数拆开写：小数部分是"该精度下的 tick 数"，不是毫秒
+        const sec = Math.floor(pkt.timestamp);
+        const frac = Math.round((pkt.timestamp - sec) * tickPerSecond);
+
+        rdv.setUint32(0, sec >>> 0, littleEndian);
+        rdv.setUint32(4, frac >>> 0, littleEndian);
+        rdv.setUint32(8, pkt.data.length, littleEndian);
+        // origLen 缺省时用实际长度；被 snaplen 截断的包应保留原始长度信息
+        rdv.setUint32(12, pkt.origLen || pkt.data.length, littleEndian);
+
+        chunks.push(rec, pkt.data);
+    }
+
+    return concatChunks(chunks);
+}
+
+
+/**
+ * 把一份抓包模型序列化成 pcapng 字节流。
+ *
+ * 相比经典 pcap，pcapng 能表达每个包的接口归属与注释。本函数按
+ * 「一个 SHB + 每个链路类型一个 IDB + 每个包一个 EPB」的最小合法结构写出，
+ * 时间戳分辨率固定用 10^-9（纳秒），这是 pcapng 的默认值。
+ *
+ * @param {PcapCapture} capture - 抓包模型
+ * @param {Object} [options={}]
+ * @param {PcapPacket[]} [options.packets] - 只写出这些包
+ * @param {boolean} [options.littleEndian] - 强制指定端序
+ * @returns {Uint8Array} pcapng 文件字节
+ */
+export function writePcapng(capture, options = {}) {
+    const packets = options.packets || capture.packets;
+    const littleEndian = options.littleEndian !== undefined ?
+        options.littleEndian :
+        capture.byteOrder !== "be";
+
+    /**
+     * 组装一个块：类型 + 总长 + 主体 + 总长（尾部再写一遍，便于反向遍历）。
+     */
+    function block(type, body) {
+        const pad = (4 - (body.length % 4)) % 4;
+        const padded = pad ? concatChunks([body, new Uint8Array(pad)]) : body;
+        const totalLen = 12 + padded.length;
+
+        const head = new Uint8Array(8);
+        const hdv = new DataView(head.buffer);
+        hdv.setUint32(0, type, littleEndian);
+        hdv.setUint32(4, totalLen, littleEndian);
+
+        const tail = new Uint8Array(4);
+        new DataView(tail.buffer).setUint32(0, totalLen, littleEndian);
+
+        return concatChunks([head, padded, tail]);
+    }
+
+    // --- SHB：字节序魔数 + 版本 + 段长度（-1 表示未知）---
+    const shbBody = new Uint8Array(16);
+    const sdv = new DataView(shbBody.buffer);
+    sdv.setUint32(0, 0x1a2b3c4d, littleEndian);
+    sdv.setUint16(4, 1, littleEndian);
+    sdv.setUint16(6, 0, littleEndian);
+    sdv.setBigUint64(8, BigInt("0xffffffffffffffff"), littleEndian);
+
+    const chunks = [block(0x0a0d0d0a, shbBody)];
+
+    // --- 按链路类型去重建 IDB ---
+    const linkTypes = Array.from(new Set(packets.map(p => p.linkType)));
+    if (!linkTypes.length) linkTypes.push(capture.linkType === null || capture.linkType === undefined ?
+        LINKTYPE.ETHERNET :
+        capture.linkType);
+
+    const interfaceIndex = new Map();
+    linkTypes.forEach((lt, i) => {
+        interfaceIndex.set(lt, i);
+
+        // 【关键】IDB 里必须显式声明 if_tsresol，否则读方按规范默认值 10^-6
+        // 解释 EPB 的时间戳，写出的纳秒 tick 会被当作微秒，时间差放大 1000 倍。
+        // if_tsresol 的取值：最高位为 0 表示以 10 为底，低 7 位是负指数，
+        // 故 9 表示 10^-9 秒（纳秒）。选项区以「码 0、长 0」结束。
+        const idbBody = new Uint8Array(20);
+        const idv = new DataView(idbBody.buffer);
+        idv.setUint16(0, lt, littleEndian);
+        idv.setUint16(2, 0, littleEndian);                   // reserved
+        idv.setUint32(4, capture.snaplen || 262144, littleEndian);
+        idv.setUint16(8, 9, littleEndian);                   // option code: if_tsresol
+        idv.setUint16(10, 1, littleEndian);                  // option length
+        idv.setUint8(12, 9);                                 // value: 10^-9
+        // 13..15 为对齐补零
+        idv.setUint16(16, 0, littleEndian);                  // opt_endofopt
+        idv.setUint16(18, 0, littleEndian);
+
+        chunks.push(block(0x00000001, idbBody));
+    });
+
+    // --- 逐包建 EPB ---
+    for (const pkt of packets) {
+        const ifId = interfaceIndex.get(pkt.linkType) || 0;
+
+        // 时间戳是 64 位无符号整数，秒 × 10^9 + 纳秒；必须用 BigInt，
+        // 否则 1.6e9 秒对应的 tick 数（1.6e18）会超出 double 的整数精度
+        const ticks = BigInt(Math.floor(pkt.timestamp)) * BigInt(1000000000) +
+            BigInt(Math.round((pkt.timestamp - Math.floor(pkt.timestamp)) * 1e9));
+        const tsHigh = Number((ticks >> BigInt(32)) & BigInt(0xffffffff));
+        const tsLow = Number(ticks & BigInt(0xffffffff));
+
+        const pad = (4 - (pkt.data.length % 4)) % 4;
+        const body = new Uint8Array(20 + pkt.data.length + pad);
+        const bdv = new DataView(body.buffer);
+
+        bdv.setUint32(0, ifId, littleEndian);
+        bdv.setUint32(4, tsHigh, littleEndian);
+        bdv.setUint32(8, tsLow, littleEndian);
+        bdv.setUint32(12, pkt.data.length, littleEndian);
+        bdv.setUint32(16, pkt.origLen || pkt.data.length, littleEndian);
+        body.set(pkt.data, 20);
+
+        chunks.push(block(0x00000006, body));
+    }
+
+    return concatChunks(chunks);
+}
+
+
 export default {
+    writePcap,
+    writePcapng,
     parsePcap,
     isPcap,
     getLinkTypeName,
