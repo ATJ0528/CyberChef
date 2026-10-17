@@ -161,13 +161,21 @@ class ExtractPcapStreams extends Operation {
         conversations.forEach((conv, i) => {
             const payloads = conv.reassembled || {aToB: new Uint8Array(0), bToA: new Uint8Array(0)};
 
-            // 方向 → 要取哪些载荷
+            // a→b 不一定就是「客户端到服务端」：a/b 只是规范排序。
+            // 先问会话谁是客户端，再把两个方向的载荷对号入座。
+            const clientIsA = conv.clientSide === "a";
+            const c2s = clientIsA ? payloads.aToB : payloads.bToA;
+            const s2c = clientIsA ? payloads.bToA : payloads.aToB;
+
+            // 方向 → 要取哪些载荷。
+            // 标注里的箭头用 ASCII 的 "->"：本操作的返回值最终会被当成字节序列
+            // 输出，非 ASCII 字符（如 U+2192）在字节化时会被截断成乱码。
             const wanted = [];
             if (direction === "Client to server" || direction === "Both") {
-                wanted.push({label: "client → server", data: payloads.aToB});
+                wanted.push({label: "client -> server", data: c2s});
             }
             if (direction === "Server to client" || direction === "Both") {
-                wanted.push({label: "server → client", data: payloads.bToA});
+                wanted.push({label: "server -> client", data: s2c});
             }
 
             for (const w of wanted) {
@@ -176,8 +184,8 @@ class ExtractPcapStreams extends Operation {
                 if (includeAnnotations) {
                     parts.push(
                         `--- Stream ${i + 1} [${conv.transportProtocol}/${conv.app.protocol}] ` +
-                        `${conv.endpoints.a.ip}:${conv.endpoints.a.port} ` +
-                        `${conv.endpoints.b.ip}:${conv.endpoints.b.port} ` +
+                        `${conv.client.ip}:${conv.client.port} ` +
+                        `${conv.server.ip}:${conv.server.port} ` +
                         `(${w.label}, ${w.data.length} bytes) ---`
                     );
                 }
