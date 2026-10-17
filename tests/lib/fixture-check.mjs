@@ -6,10 +6,21 @@ const fix = await import(pathToFileURL(`${P}/tests/lib/PcapFixtures.mjs`).href);
 const pcap = await import(pathToFileURL(`${P}/src/core/lib/Pcap.mjs`).href);
 
 let pass = 0, fail = 0;
+/**
+ * 断言辅助：用 JSON 序列化比较实际值与期望值。
+ *
+ * @param {string} name - 用例名
+ * @param {*} actual - 实际值
+ * @param {*} expected - 期望值
+ * @returns {void}
+ */
 function check(name, actual, expected) {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
-    if (ok) { pass++; console.log(`  ok   ${name}`); }
-    else { fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`); }
+    if (ok) {
+        pass++; console.log(`  ok   ${name}`);
+    } else {
+        fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`);
+    }
 }
 
 console.log("\n[1] 帧构造：以太网/IPv4/TCP 各层字段位置");

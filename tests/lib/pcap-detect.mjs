@@ -13,10 +13,21 @@ const {analysePcap, detectApplicationProtocol, buildUdpFlows, APP_PROTOCOL} =
     await import(pathToFileURL(`${P}/src/core/lib/PcapSession.mjs`).href);
 
 let pass = 0, fail = 0;
+/**
+ * 断言辅助：用 JSON 序列化比较实际值与期望值。
+ *
+ * @param {string} name - 用例名
+ * @param {*} actual - 实际值
+ * @param {*} expected - 期望值
+ * @returns {void}
+ */
 function check(name, actual, expected) {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
-    if (ok) { pass++; console.log(`  ok   ${name}`); }
-    else { fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`); }
+    if (ok) {
+        pass++; console.log(`  ok   ${name}`);
+    } else {
+        fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`);
+    }
 }
 const enc = s => new TextEncoder().encode(s);
 const ep = (port) => ({a: {ip: "10.0.0.1", port: 40000}, b: {ip: "10.0.0.2", port}});
@@ -25,8 +36,8 @@ console.log("\n[1] TLS 二进制载荷（端口 443，非文本）");
 {
     // 真实 TLS ClientHello 开头：内容类型 22、版本 3.1
     const hello = new Uint8Array([0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
-        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-        0x66, 0x77, 0x88, 0x99, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                                  0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+                                  0x66, 0x77, 0x88, 0x99, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     const r = detectApplicationProtocol(
         {aToB: hello, bToA: new Uint8Array(0)}, ep(443), "TCP");
     check("识别为 TLS", r.protocol, APP_PROTOCOL.TLS);
@@ -47,6 +58,12 @@ console.log("\n[2] TLS 记录头边界");
     check("版本高字节非 3 非法", looksTLS(mk(22, 2, 0)), false);
     check("不足 5 字节非法", looksTLS(new Uint8Array([0x16, 0x03, 0x01])), false);
 
+    /**
+     * 判断给定字节是否会被识别为 TLS。
+     *
+     * @param {Uint8Array} bytes - 单向载荷
+     * @returns {boolean}
+     */
     function looksTLS(bytes) {
         return detectApplicationProtocol({aToB: bytes, bToA: new Uint8Array(0)}, ep(9999), "TCP")
             .protocol === APP_PROTOCOL.TLS;

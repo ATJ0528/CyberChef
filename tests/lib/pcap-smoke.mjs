@@ -6,26 +6,89 @@ const LIB = new URL("../../src/core/lib/Pcap.mjs", import.meta.url).href;
 const {parsePcap, isPcap, getLinkTypeName, LINKTYPE} = await import(LIB);
 
 let pass = 0, fail = 0;
+/**
+ * 断言辅助：用 JSON 序列化比较实际值与期望值。
+ *
+ * @param {string} name - 用例名
+ * @param {*} actual - 实际值
+ * @param {*} expected - 期望值
+ * @returns {void}
+ */
 function check(name, actual, expected) {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
-    if (ok) { pass++; console.log(`  ok   ${name}`); }
-    else { fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`); }
+    if (ok) {
+        pass++; console.log(`  ok   ${name}`);
+    } else {
+        fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`);
+    }
 }
 
 // ---------- 构造工具 ----------
-function u8(...bytes) { return new Uint8Array(bytes.flat()); }
-function u16(v, le) { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, le); return b; }
-function u32(v, le) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, le); return b; }
-function big64(v, le) { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), le); return b; }
+/**
+ * 把若干字节值拼成一个 Uint8Array。
+ *
+ * @param {...number} bytes - 字节值
+ * @returns {Uint8Array}
+ */
+function u8(...bytes) {
+    return new Uint8Array(bytes.flat());
+}
+/**
+ * 按指定端序编码一个 16 位整数。
+ *
+ * @param {number} v - 数值
+ * @param {boolean} le - true 表示小端
+ * @returns {Uint8Array}
+ */
+function u16(v, le) {
+    const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, le); return b;
+}
+/**
+ * 按指定端序编码一个 32 位整数。
+ *
+ * @param {number} v - 数值
+ * @param {boolean} le - true 表示小端
+ * @returns {Uint8Array}
+ */
+function u32(v, le) {
+    const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, le); return b;
+}
+/**
+ * 按指定端序编码一个 64 位整数。
+ *
+ * @param {number|bigint} v - 数值
+ * @param {boolean} le - true 表示小端
+ * @returns {Uint8Array}
+ */
+function big64(v, le) {
+    const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), le); return b;
+}
+/**
+ * 按顺序拼接多个 Uint8Array。
+ *
+ * @param {...Uint8Array} arrs - 待拼接的数组
+ * @returns {Uint8Array}
+ */
 function cat(...arrs) {
     const total = arrs.reduce((a, x) => a + x.length, 0);
     const out = new Uint8Array(total);
     let o = 0;
-    for (const a of arrs) { out.set(a, o); o += a.length; }
+    for (const a of arrs) {
+        out.set(a, o); o += a.length;
+    }
     return out;
 }
 
 // 以太网 + IPv4 + TCP 帧
+/**
+ * 构造一个完整的以太网 / IPv4 / TCP 帧。
+ *
+ * @param {number} srcPort - 源端口
+ * @param {number} dstPort - 目的端口
+ * @param {number} seq - 序列号
+ * @param {Uint8Array} payload - 应用层载荷
+ * @returns {Uint8Array}
+ */
 function frame(srcPort, dstPort, seq, payload) {
     const eth = cat(
         u8(0x00, 0x11, 0x22, 0x33, 0x44, 0x55),   // dst mac
@@ -90,12 +153,20 @@ const c2 = parsePcap(pcapBE);
 check("识别端序", c2.byteOrder, "be");
 check("纳秒精度", c2.nanosecond, true);
 check("链路类型名", getLinkTypeName(c2.linkType), "Linux SLL (Cooked)");
-check("纳秒换算", c2.packets[0].timestamp, 1600000000.123456789);
+// 1.6e9 量级的 float64 无法表示到纳秒，只能精确到微秒，故按 6 位小数比较
+check("纳秒换算", c2.packets[0].timestamp.toFixed(6), "1600000000.123457");
 
 // ---------- 3. pcapng（小端，含 IDB 与 EPB） ----------
 console.log("\n[3] pcapng，小端");
+/**
+ * 按 pcapng 的块结构封装块体（写入块类型、长度与对齐填充）。
+ *
+ * @param {number} type - 块类型
+ * @param {Uint8Array} body - 块体
+ * @param {boolean} le - true 表示小端
+ * @returns {Uint8Array}
+ */
 function block(type, body, le) {
-    const total = 12 + body.length;
     const pad = (4 - (body.length % 4)) % 4;
     const padded = cat(body, new Uint8Array(pad));
     const totalPadded = 12 + padded.length;
@@ -150,12 +221,20 @@ check("嗅探 过短", isPcap(u8(1, 2)), false);
 
 // 损坏魔数应抛错
 let threw = false;
-try { parsePcap(u8(0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0)); } catch (e) { threw = true; }
+try {
+    parsePcap(u8(0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0));
+} catch (e) {
+    threw = true;
+}
 check("非法魔数抛错", threw, true);
 
 // 空输入应抛错
 threw = false;
-try { parsePcap(new Uint8Array(0)); } catch (e) { threw = true; }
+try {
+    parsePcap(new Uint8Array(0));
+} catch (e) {
+    threw = true;
+}
 check("空输入抛错", threw, true);
 
 // 只有全局头、没有包 → 0 包 + 警告

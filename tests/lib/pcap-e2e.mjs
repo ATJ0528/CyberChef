@@ -12,12 +12,31 @@ const {dissectCapture} = await import(pathToFileURL(`${P}/src/core/lib/PcapPacke
 const {analysePcap, APP_PROTOCOL} = await import(pathToFileURL(`${P}/src/core/lib/PcapSession.mjs`).href);
 
 let pass = 0, fail = 0;
+/**
+ * 断言辅助：用 JSON 序列化比较实际值与期望值。
+ *
+ * @param {string} name - 用例名
+ * @param {*} actual - 实际值
+ * @param {*} expected - 期望值
+ * @returns {void}
+ */
 function check(name, actual, expected) {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
-    if (ok) { pass++; console.log(`  ok   ${name}`); }
-    else { fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`); }
+    if (ok) {
+        pass++; console.log(`  ok   ${name}`);
+    } else {
+        fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`);
+    }
 }
-function text(u8) { return Buffer.from(u8).toString("utf8"); }
+/**
+ * 把字节数组按 UTF-8 解码为文本。
+ *
+ * @param {Uint8Array} u8 - 字节
+ * @returns {string}
+ */
+function text(u8) {
+    return Buffer.from(u8).toString("utf8");
+}
 
 for (const fmt of ["pcap", "pcapng"]) {
     console.log(`\n===== 端到端流水线 [${fmt}] =====`);

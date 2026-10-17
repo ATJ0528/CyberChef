@@ -16,10 +16,21 @@ const op = new FilterPcap();
 const conv = new ConvertPcapFormat();
 
 let pass = 0, fail = 0;
+/**
+ * 断言辅助：用 JSON 序列化比较实际值与期望值。
+ *
+ * @param {string} name - 用例名
+ * @param {*} actual - 实际值
+ * @param {*} expected - 期望值
+ * @returns {void}
+ */
 function check(name, actual, expected) {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
-    if (ok) { pass++; console.log(`  ok   ${name}`); }
-    else { fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`); }
+    if (ok) {
+        pass++; console.log(`  ok   ${name}`);
+    } else {
+        fail++; console.log(`  FAIL ${name}\n       期望 ${JSON.stringify(expected)}\n       实际 ${JSON.stringify(actual)}`);
+    }
 }
 const ab = (u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
@@ -39,11 +50,22 @@ const payloadOver = (n) => cnt(PAYLOADS, l => l > n);
 console.log(`基准：包数 ${FULL.packetCount}，帧长 ${JSON.stringify(FRAMES)}`);
 console.log(`      载荷长 ${JSON.stringify(PAYLOADS)}`);
 
+/**
+ * 对默认样本执行一次过滤，并解析回抓包对象。
+ *
+ * @param {string} expr - 过滤表达式
+ * @param {string} [fmt="Same as input"] - 输出格式
+ * @returns {Object} 解析后的抓包对象
+ */
 function runFilter(expr, fmt = "Same as input") {
     return parsePcap(new Uint8Array(op.run(buf, [expr, fmt])));
 }
 const tryRun = (expr) => {
-    try { return runFilter(expr).packetCount; } catch (e) { return "error"; }
+    try {
+        return runFilter(expr).packetCount;
+    } catch (e) {
+        return "error";
+    }
 };
 
 console.log("\n[1] 协议关键字");
@@ -98,8 +120,11 @@ check("嵌套括号", runFilter("tcp and (len > 100 or len < 60)").packetCount,
 
 console.log("\n[6] 错误处理");
 const expectThrow = (name, fn, mustMatch) => {
-    try { fn(); check(name, "no-error", "error"); }
-    catch (e) { check(name, mustMatch.test(e.message) ? "error" : `错误信息不符: ${e.message}`, "error"); }
+    try {
+        fn(); check(name, "no-error", "error");
+    } catch (e) {
+        check(name, mustMatch.test(e.message) ? "error" : `错误信息不符: ${e.message}`, "error");
+    }
 };
 expectThrow("未知关键字", () => runFilter("bogusproto"), /Unknown protocol keyword/);
 expectThrow("缺右括号", () => runFilter("(tcp"), /closing parenthesis/i);
