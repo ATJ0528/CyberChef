@@ -418,8 +418,10 @@ export function parsePcap(bytes, options = {}) {
         return parsePcapng(bytes, dv, maxPackets);
     }
 
+    // 调用方会统一补上 "Not a valid capture file: " 前缀，这里只说清具体原因，
+    // 避免最终提示出现两句同义话。
     throw new OperationError(
-        `Not a recognised capture file. Expected a pcap or pcapng magic number, ` +
+        `Expected a pcap or pcapng magic number, ` +
         `got 0x${magic.toString(16).padStart(8, "0")}.`
     );
 }
