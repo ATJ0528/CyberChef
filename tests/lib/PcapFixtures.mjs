@@ -16,13 +16,19 @@
  * ------------------------------------------------------------
  * 【导出接口】
  *   - checksum16(bytes)                 → number : 16 位反码校验和
- *   - ethernetFrame(opts)               → Uint8Array : 以太网帧（可带 VLAN）
- *   - tcpSegmentPayload(opts)           → Uint8Array : 完整的以太网+IPv4+TCP 帧
- *   - udpDatagramPayload(opts)          → Uint8Array : 完整的以太网+IPv4+UDP 帧
+ *   - ipv4Bytes(ip) / ipv6Bytes(ip)     → Uint8Array : 地址字符串转字节
+ *   - macBytes(mac)                     → Uint8Array : MAC 字符串转 6 字节
+ *   - ipv4Header(opts) / ipv6Header(opts) → Uint8Array : IP 首部
+ *   - tcpHeader(opts)                   → Uint8Array : TCP 首部
+ *   - tcpChecksum / tcpChecksum6 / udpChecksum → number : 传输层校验和
+ *   - tcpFrame(opts)                    → Uint8Array : 以太网+IPv4+TCP 帧
+ *   - tcpFrame6(opts)                   → Uint8Array : 以太网+IPv6+TCP 帧
+ *   - udpFrame(opts)                    → Uint8Array : 以太网+IPv4+UDP 帧
  *   - buildPcap(packets, opts)          → Uint8Array : 经典 pcap 文件
+ *   - pcapngBlock(type, body, le)       → Uint8Array : 单个 pcapng 块
  *   - buildPcapng(packets, opts)        → Uint8Array : pcapng 文件
  *   - toHex(bytes)                      → string
- *   - httpSessionFixture()              → Object : 一个完整的 HTTP 会话抓包
+ *   - httpSessionFixture(opts)          → Object : 一个完整的 HTTP 会话抓包
  * ------------------------------------------------------------
  * 【关键算法】
  *   1. 校验和用 RFC 1071 的"16 位反码求和"：按 16 位分组累加，进位回卷到
@@ -153,6 +159,94 @@ export function macBytes(mac) {
 
 
 /**
+ * 把 "2001:db8::1" 形式的字符串转成 16 字节。
+ *
+ * 支持 `::` 压缩，以及末尾内嵌 IPv4 的写法（如 `::ffff:192.168.1.1`）。
+ *
+ * @param {string} ip
+ * @returns {Uint8Array} 16 字节
+ */
+export function ipv6Bytes(ip) {
+    let text = ip;
+    let embedded = null;
+
+    // 末尾若是一个点分 IPv4，先取出 4 字节，再把它换成两个 16 位组占位
+    const m = text.match(/(\d+\.\d+\.\d+\.\d+)$/);
+    if (m) {
+        embedded = ipv4Bytes(m[1]);
+        text = text.slice(0, m.index) + "0:0";
+    }
+
+    const parseGroups = (s) => s ? s.split(":").map(g => {
+        const v = parseInt(g, 16);
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g) || Number.isNaN(v)) {
+            throw new Error(`Invalid IPv6 address: ${ip}`);
+        }
+        return v;
+    }) : [];
+
+    let groups;
+    if (text.includes("::")) {
+        const [head, tail] = text.split("::");
+        if (text.indexOf("::") !== text.lastIndexOf("::")) {
+            throw new Error(`Invalid IPv6 address: ${ip}`);
+        }
+        const a = parseGroups(head), b = parseGroups(tail);
+        const missing = 8 - a.length - b.length;
+        if (missing < 1) throw new Error(`Invalid IPv6 address: ${ip}`);
+        groups = [...a, ...new Array(missing).fill(0), ...b];
+    } else {
+        groups = parseGroups(text);
+    }
+
+    if (groups.length !== 8) throw new Error(`Invalid IPv6 address: ${ip}`);
+
+    const out = new Uint8Array(16);
+    const dv = new DataView(out.buffer);
+    groups.forEach((g, i) => dv.setUint16(i * 2, g, false));
+    if (embedded) out.set(embedded, 12);
+
+    return out;
+}
+
+
+/**
+ * 构造 IPv6 首部（40 字节，无扩展首部）。
+ *
+ * @param {Object} opts
+ * @param {string} opts.src - 源 IPv6 地址
+ * @param {string} opts.dst - 目的 IPv6 地址
+ * @param {number} opts.nextHeader - 下一个首部（6=TCP，17=UDP，58=ICMPv6）
+ * @param {number} opts.payloadLength - 载荷长度（不含 IPv6 首部）
+ * @param {number} [opts.hopLimit=64]
+ * @param {number} [opts.trafficClass=0]
+ * @param {number} [opts.flowLabel=0]
+ * @returns {Uint8Array} 40 字节首部
+ */
+export function ipv6Header(opts) {
+    const {
+        src, dst,
+        nextHeader, payloadLength,
+        hopLimit = 64,
+        trafficClass = 0,
+        flowLabel = 0,
+    } = opts;
+
+    const header = new Uint8Array(40);
+    const dv = new DataView(header.buffer);
+
+    dv.setUint32(0, (6 << 28) | ((trafficClass & 0xff) << 20) | (flowLabel & 0xfffff), false);
+    dv.setUint16(4, payloadLength, false);
+    dv.setUint8(6, nextHeader);
+    dv.setUint8(7, hopLimit);
+    header.set(ipv6Bytes(src), 8);
+    header.set(ipv6Bytes(dst), 24);
+
+    return header;
+}
+
+
+/**
  * 构造 IPv4 首部（20 字节，无选项）。
  *
  * 校验和字段在最后一步按 RFC 1071 填入。
@@ -273,6 +367,77 @@ export function udpChecksum(udpDatagram, srcIp, dstIp) {
         u16be(udpDatagram.length)
     );
     return checksum16(concat(pseudo, udpDatagram));
+}
+
+
+/**
+ * 计算 IPv6 下 TCP 的校验和（RFC 8200 伪首部）。
+ *
+ * 伪首部 = 源地址(16) + 目的地址(16) + 上层报文长度(4) + 全 0(3) + 下一首部(1)。
+ *
+ * @param {Uint8Array} tcpSegment - TCP 首部 + 数据（校验和字段须为 0）
+ * @param {string} srcIp
+ * @param {string} dstIp
+ * @returns {number} 16 位校验和
+ */
+export function tcpChecksum6(tcpSegment, srcIp, dstIp) {
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, tcpSegment.length, false);
+
+    const pseudo = concat(
+        ipv6Bytes(srcIp),
+        ipv6Bytes(dstIp),
+        length,
+        new Uint8Array([0, 0, 0, 6])            // 3 字节全 0 + 协议号 TCP
+    );
+    return checksum16(concat(pseudo, tcpSegment));
+}
+
+
+/**
+ * 构造一个完整的以太网 + IPv6 + TCP 帧。
+ *
+ * @param {Object} opts
+ * @param {string} [opts.srcMac="66:77:88:99:aa:bb"]
+ * @param {string} [opts.dstMac="00:11:22:33:44:55"]
+ * @param {string} opts.srcIp - IPv6 源地址
+ * @param {string} opts.dstIp - IPv6 目的地址
+ * @param {number} opts.srcPort
+ * @param {number} opts.dstPort
+ * @param {number} opts.seq
+ * @param {number} [opts.ack=0]
+ * @param {number} opts.flags
+ * @param {Uint8Array|number[]} [opts.payload=[]]
+ * @param {number|null} [opts.vlanId=null]
+ * @returns {Uint8Array} 完整帧
+ */
+export function tcpFrame6(opts) {
+    const {
+        srcMac = "66:77:88:99:aa:bb",
+        dstMac = "00:11:22:33:44:55",
+        srcIp, dstIp, srcPort, dstPort, seq,
+        ack = 0,
+        flags,
+        payload = [],
+        vlanId = null,
+    } = opts;
+
+    const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+
+    const tcp = tcpHeader({srcPort, dstPort, seq, ack, flags});
+    const segment = concat(tcp, payloadBytes);
+    new DataView(segment.buffer, segment.byteOffset).setUint16(16, tcpChecksum6(segment, srcIp, dstIp), false);
+
+    const ip = ipv6Header({src: srcIp, dst: dstIp, nextHeader: 6, payloadLength: segment.length});
+
+    let eth;
+    if (vlanId === null) {
+        eth = concat(macBytes(dstMac), macBytes(srcMac), u16be(0x86dd));
+    } else {
+        eth = concat(macBytes(dstMac), macBytes(srcMac), u16be(0x8100), u16be(vlanId & 0x0fff), u16be(0x86dd));
+    }
+
+    return concat(eth, ip, segment);
 }
 
 
