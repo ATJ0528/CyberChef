@@ -14,6 +14,36 @@
  * Algorithm released under the BSD-3-clause licence
 */
 
+/**
+ * ============================================================
+ * 【模块】SSH 指纹（Crypto）— HASSH 服务端指纹
+ * 【操作】HASSH Server Fingerprint
+ * 【功能】解析服务端发来的 SSH_MSG_KEXINIT，拼接算法列表取 MD5，标识 SSH 服务端
+ * 【输入】string —— SSH_MSG_KEXINIT（Server→Client）应用层报文的 Hex / Base64 / Raw
+ * 【输出】string —— MD5 摘要 / HASSH 算法串 / 完整细节
+ * ------------------------------------------------------------
+ * 【业务流程】
+ *   1. 转字节数组并包成 Stream 游标
+ *   2. 读 4 字节包长度并核对，读 1 字节 padding length、1 字节 message code（须为 20 = SSH_MSG_KEXINIT）
+ *   3. 跳过 16 字节 cookie
+ *   4. 依次读取各算法名称列表（每段 4 字节长度 + 名称串）：
+ *        kex / host key / enc C2S / enc S2C / mac C2S / mac S2C / comp C2S / comp S2C / lang C2S / lang S2C
+ *   5. 跳过 1 字节 first_kex_packet_follows、4 字节 reserved、paddingLength 字节 padding
+ *   6. 拼接 kexAlgos;encAlgosS2C;macAlgosS2C;compAlgosS2C 得 HASSH 串，取 MD5 得摘要
+ *   7. 按 Output format 返回摘要 / 算法串 / 完整细节
+ * ------------------------------------------------------------
+ * 【关键算法】
+ *   HASSH = MD5( kexAlgorithms ; encryptionAlgorithmsServerToClient ; macAlgorithmsServerToClient ; compressionAlgorithmsServerToClient )
+ *   四个字段用英文分号 ";" 连接；每个字段本身是算法名列表的**原字符串**
+ *   （列表内部由算法名以英文逗号分隔），因此拼接时不展开列表
+ *   服务端指纹只取 Server→Client 方向的 enc / mac / comp 算法
+ * ------------------------------------------------------------
+ * 【开发技巧】
+ *   - Stream 游标 API：readInt(n) 读 n 字节大端整数，readString(len) 读成字符串，moveForwardsBy(n) 跳过
+ *   - 客户端→服务端方向的算法段只在帧内占位，用 moveForwardsBy 跳过即可
+ * ============================================================
+ */
+
 import Operation from "../Operation.mjs";
 import OperationError from "../errors/OperationError.mjs";
 import Utils from "../Utils.mjs";
@@ -22,11 +52,18 @@ import {runHash} from "../lib/Hash.mjs";
 
 /**
  * HASSH Server Fingerprint operation
+ *
+ * 继承 Operation 基类，run() 内以游标顺序解析 SSH_MSG_KEXINIT 字节流。
  */
 class HASSHServerFingerprint extends Operation {
 
     /**
      * HASSHServerFingerprint constructor
+     *
+     * 声明元信息与参数：
+     *   name "HASSH Server Fingerprint"、module "Crypto"、inputType / outputType 均为 string
+     *   args[0] "Input format"  —— Hex / Base64 / Raw
+     *   args[1] "Output format" —— Hash digest（MD5 摘要）/ HASSH algorithms string / Full details
      */
     constructor() {
         super();
@@ -52,6 +89,11 @@ class HASSHServerFingerprint extends Operation {
     }
 
     /**
+     * 【主流程】计算 HASSH 服务端指纹
+     *
+     * args[0] = Input format，args[1] = Output format
+     * 逐个读取 SSH_MSG_KEXINIT 的算法名称列表，取服务端方向字段拼接后取 MD5
+     *
      * @param {string} input
      * @param {Object[]} args
      * @returns {string}
@@ -59,6 +101,7 @@ class HASSHServerFingerprint extends Operation {
     run(input, args) {
         const [inputFormat, outputFormat] = args;
 
+        // --- 步骤 1：转字节数组、包 Stream 游标，并读 4 字节包长度校验 ---
         input = Utils.convertToByteArray(input, inputFormat);
         const s = new Stream(new Uint8Array(input));
 
@@ -67,6 +110,7 @@ class HASSHServerFingerprint extends Operation {
         if (s.length !== length + 4)
             throw new OperationError("Incorrect packet length.");
 
+        // --- 步骤 2：读 padding length 与 message code（须为 20 = SSH_MSG_KEXINIT）---
         // Padding length
         const paddingLength = s.readInt(1);
 
@@ -75,9 +119,11 @@ class HASSHServerFingerprint extends Operation {
         if (messageCode !== 20)
             throw new OperationError("Not a Key Exchange Init.");
 
+        // --- 步骤 3：跳过 16 字节 cookie ---
         // Cookie
         s.moveForwardsBy(16);
 
+        // --- 步骤 4：依次读取各算法名称列表（kex / host key / enc / mac / comp / lang，各含 C2S 与 S2C）---
         // KEX Algorithms
         const kexAlgosLength = s.readInt(4);
         const kexAlgos = s.readString(kexAlgosLength);
@@ -118,6 +164,7 @@ class HASSHServerFingerprint extends Operation {
         const langsS2CLength = s.readInt(4);
         s.moveForwardsBy(langsS2CLength);
 
+        // --- 步骤 5：跳过 first_kex_packet_follows、reserved 与填充字节 ---
         // First KEX packet follows
         s.moveForwardsBy(1);
 
@@ -127,6 +174,7 @@ class HASSHServerFingerprint extends Operation {
         // Padding string
         s.moveForwardsBy(paddingLength);
 
+        // --- 步骤 6：按 kex;encS2C;macS2C;compS2C 拼接为 HASSH 串，再取 MD5 摘要 ---
         // Output
         const hassh = [
             kexAlgos,

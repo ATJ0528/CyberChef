@@ -4,13 +4,60 @@
  * @license Apache-2.0
  */
 
+/**
+ * ============================================================
+ * 【模块】网络协议解析（Networking）— IPv6 过渡地址
+ * 【操作】IPv6 Transition Addresses
+ * 【功能】在 IPv4 地址与其各类 IPv6 过渡地址之间互转，并可把 MAC 地址转成 EUI-64 接口标识
+ * 【输入】string —— 每行一个 IPv4、IPv4/24（范围）、MAC 或 IPv6 地址
+ * 【输出】string —— 每行对应一组转换结果（可由参数控制是否带文字标签头）
+ * ------------------------------------------------------------
+ * 【业务流程】
+ *   1. 按 \n 拆分输入并用 filter(Boolean) 剔除空行
+ *   2. 逐行判定类型并分派：
+ *        IPv4 纯地址     → ipTransition(行, false)
+ *        IPv4 且以 /24 结尾 → ipTransition(行, true)（按范围输出）
+ *        MAC 地址        → macTransition(行)
+ *        IPv6 地址       → unTransition(行)（反向还原）
+ *   3. 依据 args[0] "Ignore ranges" 决定是否跳过含 "/" 的范围行
+ *   4. 依据 args[1] "Remove headers" 决定是否省略结果前的文字标签
+ *   5. 拼接所有行返回；遇到无法识别的行则给出统一提示
+ * ------------------------------------------------------------
+ * 【关键算法】
+ *   - XOR 表 {"0":"2","1":"3",…,"e":"c","f":"d"} 实现「首字节低 nibble 异或 2」，
+ *     等价于翻转字节第 7 位（U/L 通用/本地位）；MAC→EUI-64 与 EUI-64→MAC 都靠它可逆变换
+ *   - hexify / intify：字节与两位十六进制互转的基本工具
+ *   - 各种过渡前缀：6to4 = 2002::/16；IPv4-mapped = ::ffff:0:0/96；
+ *     IPv4-translated = ::ffff:0:0:0/96；NAT64 = 64:ff9b::/96
+ *   - MAC→EUI-64：6 字节按 [0][1]:[2]ff:fe[3]:[4][5] 重排（插入 ff:fe），再翻转 U/L 位
+ *   - 反向还原：unTransition 用 startsWith 判前缀、用 slice 按固定偏移取出内嵌 IPv4 的
+ *     四段十六进制，或取出 EUI-64 各字节；EUI-64 的判据是第 12-13 字节为 FF:FE
+ * ------------------------------------------------------------
+ * 【开发技巧】
+ *   - 用一条超长正则统一校验 IPv6 的压缩/展开诸写法，避免手写解析状态机
+ *   - args[1]（Remove headers）作为输出开关，贯穿所有转换函数，便于直接复制结果
+ *   - 注意：非法输入分支用的是赋值 `output = "…"` 而非 `+=`，会覆盖此前累积结果并给出统一提示
+ *   - 目前仅处理 /24 范围
+ * ============================================================
+ */
+
 import Operation from "../Operation.mjs";
 
+/**
+ * 【类】IPv6TransitionAddresses —— IPv6 过渡地址互转操作
+ * 继承 Operation 基类，只实现 run()；内部用若干嵌套函数分别完成正/反向转换。
+ */
 /**
  * IPv6 Transition Addresses operation
  */
 class IPv6TransitionAddresses extends Operation {
 
+    /**
+     * 【构造函数】声明元信息与两个布尔参数
+     * name = "IPv6 Transition Addresses"，module = "Default"，inputType/outputType 均为 "string"。
+     * args[0] Ignore ranges  —— true 时忽略带 "/" 的网段行，只处理单个地址（默认 true）
+     * args[1] Remove headers —— true 时输出中不带 "6to4:" 等文字标签，便于直接取用（默认 false）
+     */
     /**
      * IPv6TransitionAddresses constructor
      */
@@ -38,6 +85,10 @@ class IPv6TransitionAddresses extends Operation {
     }
 
     /**
+     * 【主流程】逐行识别地址类型并做对应的过渡转换
+     * 返回汇总后的文本；args 见构造函数注释。
+     */
+    /**
      * @param {string} input
      * @param {Object[]} args
      * @returns {string}
@@ -45,6 +96,7 @@ class IPv6TransitionAddresses extends Operation {
     run(input, args) {
         const XOR = {"0": "2", "1": "3", "2": "0", "3": "1", "4": "6", "5": "7", "6": "4", "7": "5", "8": "a", "9": "b", "a": "8", "b": "9", "c": "e", "d": "f", "e": "c", "f": "d"};
 
+        // 【辅助函数】hexify：把十进制字节值转成两位小写十六进制字符串（不足两位左补 0）
         /**
 	 * Function to convert to hex
 	 */
@@ -52,6 +104,7 @@ class IPv6TransitionAddresses extends Operation {
             return Number(octet).toString(16).padStart(2, "0");
         }
 
+        // 【辅助函数】intify：把十六进制字符串按 16 进制解析为整数
         /**
 	 * Function to convert Hex to Int
 	 */
@@ -59,6 +112,8 @@ class IPv6TransitionAddresses extends Operation {
             return parseInt(hex, 16);
         }
 
+        // 【正向转换】把 IPv4 转成 6to4 / IPv4-mapped / IPv4-translated / NAT64 四种过渡地址；
+        // range=true 时输出网段写法（/40、/120），false 时给出具体地址（/48 或单地址）
         /**
 	 * Function converts IPv4 to IPv6 Transtion address
 	 */
@@ -121,6 +176,7 @@ class IPv6TransitionAddresses extends Operation {
             return output;
         }
 
+        // 【正向转换】把 MAC 地址转成 EUI-64 接口标识：插入 ff:fe 并翻转首字节 U/L 位
         /**
 	 * Convert MAC to EUI-64
 	 */
@@ -137,6 +193,8 @@ class IPv6TransitionAddresses extends Operation {
         }
 
 
+        // 【反向转换】把各类过渡 IPv6 地址还原为原始 IPv4 或 MAC；
+        // 依次判前缀 2002:(6to4) / ::ffff: 等(Mapped/Translated/NAT64) / 含 FF:FE(EUI-64)
         /**
 	 * Convert IPv6 address to its original IPv4 or MAC address
 	 */
@@ -176,6 +234,7 @@ class IPv6TransitionAddresses extends Operation {
         }
 
 
+        // 【Main】输入预处理：按行拆分并按真值过滤，剔除空行后进入主循环
         /**
 	 * Main
 	 */
@@ -184,6 +243,7 @@ class IPv6TransitionAddresses extends Operation {
         // Remove blank rows
         inputs = inputs.filter(Boolean);
 
+        // --- 主循环：逐行判定类型（IPv4 / IPv4范围 / MAC / IPv6）并分派 ---
         for (let i = 0; i < inputs.length; i++) {
             // if ignore ranges is checked and input is a range, skip
             if ((args[0] && !inputs[i].includes("/")) || (!args[0])) {
