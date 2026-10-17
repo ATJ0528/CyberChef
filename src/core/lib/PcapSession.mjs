@@ -592,7 +592,11 @@ export function analysePcap(capture, options = {}) {
         const key = `${pkt.transport.protocol === "TCP" ? "tcp" : "udp"}:${a.ip}:${a.port}-${b.ip}:${b.port}`;
 
         const conv = conversations.get(key);
-        if (conv) conv.addPacket(pkt);
+        if (conv) {
+            conv.addPacket(pkt);
+            // 回填会话键，让下游（如 Filter PCAP）无需重算四元组就能知道包的归属
+            pkt.conversationKey = key;
+        }
     }
 
     // --- 步骤 5：应用层识别 ---
@@ -616,6 +620,13 @@ export function analysePcap(capture, options = {}) {
 
         conv.reassembled = payloads;
         conv.app = detectApplicationProtocol(payloads, conv.endpoints, conv.transportProtocol);
+
+        // 把识别结果回填到该会话的每个包上。应用层协议只有看完整条流
+        // 才能判定，而过滤是按包进行的，因此必须把结论下推到包一级。
+        for (const pkt of conv.packets) {
+            pkt.appProtocol = conv.app.protocol;
+            pkt.appConfidence = conv.app.confidence;
+        }
     }
 
     analysis.conversations = Array.from(conversations.values())
